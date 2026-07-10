@@ -343,6 +343,18 @@ llm:
   model: "gpt-4"
 ```
 
+### litellm proxy
+
+Newscope can talk to a [litellm](https://github.com/BerriAI/litellm) proxy through `endpoint`. Some providers behind litellm (e.g. a ChatGPT subscription) have a broken non-streaming response path for reasoning models (gpt-5 / o-series); set `use_streaming: true` to work around it:
+
+```yaml
+llm:
+  endpoint: http://litellm:4000/v1
+  api_key: ${LITELLM_API_KEY}
+  model: gpt-5
+  use_streaming: true
+```
+
 ## Things to Know
 
 - Articles are scored 0-10 based on relevance to your interests
