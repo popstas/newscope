@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -797,4 +798,106 @@ func TestFeedProcessor_ProcessItem_NonHTMLContent(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, extractor.ExtractCalls(), 1)
 	assert.Len(t, itemManager.UpdateItemExtractionCalls(), 1)
+}
+
+func TestIsTransientExtractError(t *testing.T) {
+	transient := []string{
+		"client error: 429",
+		"server error: 503",
+		"server error: 500",
+		"context deadline exceeded",
+		"Get \"https://x\": net/http: request canceled (timeout)",
+		"dial tcp: connection refused",
+		"read: connection reset by peer",
+		"lookup example.com: no such host",
+		"temporary failure",
+	}
+	for _, s := range transient {
+		assert.True(t, isTransientExtractError(errors.New(s)), "should be transient: %q", s)
+	}
+
+	permanent := []string{
+		"client error: 403",
+		"client error: 401",
+		"client error: 404",
+		"unsupported content type: application/pdf",
+		"content too short: 7 chars",
+	}
+	for _, s := range permanent {
+		assert.False(t, isTransientExtractError(errors.New(s)), "should be permanent: %q", s)
+	}
+
+	assert.False(t, isTransientExtractError(nil))
+}
+
+func TestFeedProcessor_extractContent_RetriesTransient(t *testing.T) {
+	itemManager := &mocks.ItemManagerMock{}
+	extractor := &mocks.ExtractorMock{}
+	retryFunc := func(ctx context.Context, op func() error) error { return op() }
+
+	fp := NewFeedProcessor(FeedProcessorConfig{
+		FeedManager:           &mocks.FeedManagerMock{},
+		ItemManager:           itemManager,
+		ClassificationManager: &mocks.ClassificationManagerMock{},
+		SettingManager:        &mocks.SettingManagerMock{},
+		Parser:                &mocks.ParserMock{},
+		Extractor:             extractor,
+		Classifier:            &mocks.ClassifierMock{},
+		MaxWorkers:            1,
+		RetryFunc:             retryFunc,
+	})
+
+	calls := 0
+	extractor.ExtractFunc = func(ctx context.Context, url string) (*content.ExtractResult, error) {
+		calls++
+		if calls == 1 {
+			return nil, errors.New("server error: 503")
+		}
+		return &content.ExtractResult{Content: "ok", RichContent: "<p>ok</p>"}, nil
+	}
+	var stored *domain.ExtractedContent
+	itemManager.UpdateItemExtractionFunc = func(ctx context.Context, id int64, ext *domain.ExtractedContent) error {
+		stored = ext
+		return nil
+	}
+
+	fp.extractContent(context.Background(), &domain.Item{ID: 1, Link: "https://example.com/1", Title: "t"})
+
+	assert.Len(t, extractor.ExtractCalls(), 2, "transient error should be retried once then succeed")
+	require.NotNil(t, stored)
+	assert.Equal(t, "ok", stored.PlainText)
+	assert.Empty(t, stored.Error)
+}
+
+func TestFeedProcessor_extractContent_NoRetryPermanent(t *testing.T) {
+	itemManager := &mocks.ItemManagerMock{}
+	extractor := &mocks.ExtractorMock{}
+	retryFunc := func(ctx context.Context, op func() error) error { return op() }
+
+	fp := NewFeedProcessor(FeedProcessorConfig{
+		FeedManager:           &mocks.FeedManagerMock{},
+		ItemManager:           itemManager,
+		ClassificationManager: &mocks.ClassificationManagerMock{},
+		SettingManager:        &mocks.SettingManagerMock{},
+		Parser:                &mocks.ParserMock{},
+		Extractor:             extractor,
+		Classifier:            &mocks.ClassifierMock{},
+		MaxWorkers:            1,
+		RetryFunc:             retryFunc,
+	})
+
+	extractor.ExtractFunc = func(ctx context.Context, url string) (*content.ExtractResult, error) {
+		return nil, errors.New("client error: 404")
+	}
+	var stored *domain.ExtractedContent
+	itemManager.UpdateItemExtractionFunc = func(ctx context.Context, id int64, ext *domain.ExtractedContent) error {
+		stored = ext
+		return nil
+	}
+
+	fp.extractContent(context.Background(), &domain.Item{ID: 2, Link: "https://example.com/2", Title: "t"})
+
+	assert.Len(t, extractor.ExtractCalls(), 1, "permanent error must not be retried")
+	require.NotNil(t, stored)
+	assert.Equal(t, "client error: 404", stored.Error)
 }
